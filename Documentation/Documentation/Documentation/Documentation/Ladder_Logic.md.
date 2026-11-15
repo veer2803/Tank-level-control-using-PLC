@@ -1,0 +1,410 @@
+# PLC-Based Tank Level Control and Automation System
+## OpenPLC Ladder Logic Design
+
+**PLC Platform:** OpenPLC  
+**Programming Language:** IEC 61131-3 Ladder Diagram (LD)  
+**Development Environment:** OpenPLC Editor  
+**Control Type:** Digital Input/Output Control
+
+---
+
+## 1. Introduction
+
+This document describes the proposed Ladder Logic implementation of the tank-level control system.
+
+The program is divided into functional networks covering:
+
+1. Emergency stop and master enable
+2. Tank-level status detection
+3. Fault detection
+4. Operating mode selection
+5. Automatic filling
+6. Manual draining
+7. Output control and interlocking
+8. Indicator lamps
+
+The addresses used throughout this document follow the OpenPLC variable mapping.
+
+**Notation:**
+
+| Symbol | Description |
+|---|---|
+| `--| |--` | Normally open contact |
+| `--|/|--` | Normally closed contact |
+| `--( )--` | Output coil |
+| `--(S)--` | Set/latch coil |
+| `--(R)--` | Reset/unlatch coil |
+| `TON` | On-delay timer |
+
+## 2. OpenPLC Variable Addressing
+
+### 2.1 Digital Inputs
+
+| OpenPLC Address | Variable |
+|---|---|
+| `%IX0.0` | PB_EStop |
+| `%IX0.1` | PB_FaultReset |
+| `%IX0.2` | SW_ModeAuto |
+| `%IX0.3` | LS_LowLow |
+| `%IX0.4` | LS_Low |
+| `%IX0.5` | LS_High |
+| `%IX0.6` | LS_HighHigh |
+| `%IX0.7` | PB_ManDrain |
+
+### 2.2 Digital Outputs
+
+| OpenPLC Address | Variable |
+|---|---|
+| `%QX0.0` | MP1_FillPump |
+| `%QX0.1` | SV1_FillValve |
+| `%QX0.2` | SV2_DrainValve |
+| `%QX0.3` | HL1_RunLamp |
+| `%QX0.4` | HL2_AlarmLamp |
+| `%QX0.5` | HL3_DrainLamp |
+
+### 2.3 Internal Memory Bits
+
+| OpenPLC Address | Variable |
+|---|---|
+| `%MX0.0` | MR_MasterEnable |
+| `%MX0.1` | MR_FaultOverflow |
+| `%MX0.2` | MR_FaultDryRun |
+| `%MX0.3` | MR_FaultAny |
+| `%MX0.4` | MR_AutoMode |
+| `%MX0.5` | MR_ManualMode |
+| `%MX0.6` | MR_FillActive |
+| `%MX0.7` | MR_DrainActive |
+| `%MX1.0` | MR_TankEmpty |
+| `%MX1.1` | MR_TankFull |
+| `%MX1.2` | MR_FaultFillTimeout |
+| `%MX1.3` | MR_FaultDrainTimeout |
+
+## 3. Timer Configuration
+
+| Timer | Type | Preset |
+|---|---|---|
+| TON_DryRunDelay | TON | T#5s |
+| TON_FillTimeout | TON | T#120s |
+| TON_DrainTimeout | TON | T#180s |
+
+The timers are intended to supervise abnormal operating conditions.
+
+## 4. Network 1 – Emergency Stop and Master Enable
+
+**Purpose:** Generate the master permission bit.
+
+The emergency-stop input is described as normally closed, meaning TRUE represents a healthy circuit.
+
+```text
+ PB_EStop          MR_FaultAny
+ --| |---------------|/|----------------( MR_MasterEnable )
+```
+
+The master enable is active only when the emergency-stop circuit is healthy and no combined fault is active.
+
+## 5. Network 2 – Tank-Level Status
+
+**Purpose:** Convert level-sensor signals into internal status bits.
+
+Tank-empty status:
+
+```text
+ LS_LowLow
+ --|/|--------------------------------( MR_TankEmpty )
+```
+
+Tank-full status:
+
+```text
+ LS_High
+ --| |--------------------------------( MR_TankFull )
+```
+
+The reference defines the empty condition as the inactive state of the Low-Low sensor. Confirm the sensor polarity before implementing this network.
+
+## 6. Network 3 – Overflow Fault
+
+**Purpose:** Detect and latch an overflow condition.
+
+Fault activation:
+
+```text
+ LS_HighHigh
+ --| |--------------------------------(S MR_FaultOverflow)
+```
+
+Fault reset:
+
+```text
+ PB_FaultReset       LS_HighHigh
+ --| |-----------------|/|------------(R MR_FaultOverflow)
+```
+
+The fault is reset only when the High-High condition has cleared and the reset pushbutton is pressed.
+
+## 7. Network 4 – Dry-Run Monitoring
+
+**Purpose:** Monitor the specified low-level condition while the fill operation is active.
+
+Timer logic:
+
+```text
+ MR_FillActive       LS_LowLow
+ --| |-----------------|/|------------[ TON_DryRunDelay ]
+
+ PT = T#5s
+```
+
+Fault activation:
+
+```text
+ TON_DryRunDelay.Q
+ --| |--------------------------------(S MR_FaultDryRun)
+```
+
+The reference specifies a 5-second delay.
+
+**Verification:** The actual sensor polarity and fault reset logic must be checked. A low-level condition alone does not conclusively establish that a pump is running dry. Flow or pressure feedback would improve the protection.
+
+## 8. Network 5 – Fill Timeout Monitoring
+
+**Purpose:** Detect a filling operation that exceeds the permitted duration.
+
+```text
+ MR_FillActive       LS_High
+ --| |-----------------|/|------------[ TON_FillTimeout ]
+
+ PT = T#120s
+```
+
+Fault activation:
+
+```text
+ TON_FillTimeout.Q
+ --| |--------------------------------(S MR_FaultFillTimeout)
+```
+
+The timeout fault is generated if the tank does not reach the HIGH-level condition within 120 seconds.
+
+## 9. Network 6 – Drain Timeout Monitoring
+
+**Purpose:** Detect a draining operation that exceeds the permitted duration.
+
+```text
+ MR_DrainActive      MR_TankEmpty
+ --| |-----------------|/|------------[ TON_DrainTimeout ]
+
+ PT = T#180s
+```
+
+Fault activation:
+
+```text
+ TON_DrainTimeout.Q
+ --| |--------------------------------(S MR_FaultDrainTimeout)
+```
+
+The timeout fault is generated if the tank does not reach the empty condition within 180 seconds.
+
+## 10. Network 7 – Combined Fault Status
+
+**Purpose:** Combine all individual fault conditions.
+
+```text
+ MR_FaultOverflow
+ --| |--------------------+
+                          |
+ MR_FaultDryRun           |
+ --| |--------------------+
+                          |
+ MR_FaultFillTimeout      +--------( MR_FaultAny )
+ --| |--------------------+
+                          |
+ MR_FaultDrainTimeout     |
+ --| |--------------------+
+```
+
+The combined fault bit represents the overall system fault condition.
+
+## 11. Network 8 – Operating Mode Selection
+
+Automatic mode:
+
+```text
+ MR_MasterEnable       SW_ModeAuto
+ --| |-------------------| |------------( MR_AutoMode )
+```
+
+Manual mode:
+
+```text
+ MR_MasterEnable       SW_ModeAuto
+ --| |-------------------|/|------------( MR_ManualMode )
+```
+
+Only one operating mode should be active at a time.
+
+## 12. Network 9 – Automatic Filling
+
+**Purpose:** Start filling below the LOW threshold and stop at the HIGH threshold.
+
+### Fill Start Conditions
+
+- Automatic mode active.
+- LOW-level sensor inactive.
+- Tank not full.
+- Draining inactive.
+- No fault present.
+- Master enable available.
+
+Conceptual Ladder representation:
+
+```text
+ MR_AutoMode      LS_Low       MR_TankFull
+ --| |-------------|/|------------|/|------+
+                                             |
+ MR_DrainActive                              |
+ --|/|---------------------------------------+
+                                             |
+ MR_MasterEnable                             +----(S MR_FillActive)
+ --| |---------------------------------------+
+                                             |
+ MR_FaultAny                                 |
+ --|/|---------------------------------------+
+```
+
+### Fill Stop Conditions
+
+```text
+ LS_High
+ --| |-------------------------+
+                               |
+ MR_FaultAny                   |
+ --| |-------------------------+
+                               |
+ MR_MasterEnable               +----(R MR_FillActive)
+ --|/|-------------------------+
+                               |
+ TON_FillTimeout.Q             |
+ --| |-------------------------+
+```
+
+The fill cycle starts when the tank drops below the LOW threshold and stops when the HIGH threshold is reached or a stop condition occurs.
+
+**Implementation note:** The reference describes LOW-level initiation, but its exact contact arrangement and latching logic have not been inspected in the actual OpenPLC program. The above is a functional representation that must be validated before implementation.
+
+## 13. Network 10 – Manual Draining
+
+**Purpose:** Allow manual draining when the operator requests it.
+
+### Drain Start Conditions
+
+- Manual mode active.
+- Drain pushbutton pressed.
+- Tank not empty.
+- Filling inactive.
+- No fault present.
+- Master enable available.
+
+Conceptual Ladder representation:
+
+```text
+ MR_ManualMode     PB_ManDrain      MR_TankEmpty
+ --| |----------------| |--------------|/|------+
+
+ MR_FillActive
+ --|/|------------------------------------------+
+
+ MR_MasterEnable
+ --| |------------------------------------------+
+
+ MR_FaultAny
+ --|/|------------------------------------------+
+                                                  |
+                                                  +--( MR_DrainActive )
+```
+
+Draining stops when the pushbutton is released, the tank becomes empty, a fault occurs, master enable is lost or the drain timeout is reached.
+
+## 14. Network 11 – Physical Output Control
+
+### Fill Pump
+
+```text
+ MR_MasterEnable     MR_FillActive     MR_DrainActive
+ --| |------------------| |---------------|/|----( MP1_FillPump )
+```
+
+### Fill Solenoid Valve
+
+```text
+ MR_MasterEnable     MR_FillActive     MR_DrainActive
+ --| |------------------| |---------------|/|----( SV1_FillValve )
+```
+
+### Drain Solenoid Valve
+
+```text
+ MR_MasterEnable     MR_DrainActive    MR_FillActive
+ --| |------------------| |---------------|/|----( SV2_DrainValve )
+```
+
+These conditions provide logical interlocking between filling and draining.
+
+## 15. Network 12 – Indicator Lamps
+
+Filling indicator:
+
+```text
+ MP1_FillPump
+ --| |--------------------------------( HL1_RunLamp )
+```
+
+Alarm indicator:
+
+```text
+ MR_FaultAny
+ --| |--------------------------------( HL2_AlarmLamp )
+```
+
+Draining indicator:
+
+```text
+ SV2_DrainValve
+ --| |--------------------------------( HL3_DrainLamp )
+```
+
+The reference network description specifies a steady alarm indication.
+
+## 16. Fault Reset and Timer Reset Requirements
+
+The reference documentation does not fully define the reset networks for all faults.
+
+Before implementing the program, define:
+
+1. Reset conditions for dry-run, fill-timeout and drain-timeout faults.
+2. Timer reset conditions when filling or draining stops.
+3. Whether a fault reset requires the underlying fault condition to clear first.
+4. Whether a new start condition is required after fault reset.
+5. Whether a fault reset can accidentally restart an output.
+
+These details must be implemented and tested in OpenPLC.
+
+## 17. Implementation and Verification Notes
+
+- Use OpenPLC addresses consistently throughout the program.
+- Confirm sensor wiring and active-state polarity.
+- Verify the TON timer input and reset behaviour.
+- Ensure each output has a single, unambiguous controlling coil.
+- Verify filling/draining interlocks.
+- Use suitable motor protection and interface devices.
+- Do not rely on standard PLC logic as the sole emergency-stop safety mechanism.
+- Test the program with simulated inputs before connecting physical equipment.
+
+---
+
+## 18. Document Status
+
+**Status:** Proposed OpenPLC Ladder Logic design based on the reference project's README and control-sequence documentation.
+
+The networks above are conceptual representations and have not been independently compiled, simulated or commissioned in OpenPLC. The actual implementation must be validated against the intended process and hardware configuration.
